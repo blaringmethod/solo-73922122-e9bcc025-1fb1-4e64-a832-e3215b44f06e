@@ -87,3 +87,48 @@ CREATE TABLE IF NOT EXISTS batch_results (
 );
 CREATE INDEX IF NOT EXISTS idx_batch_results_page
     ON batch_results (batch_id, item_seq);
+
+-- ---------------------------------------------------------------------------
+-- Chunk-level failure diagnostics
+--
+-- One row per failed chunk attempt. The row is written *before* the failed
+-- items are handed back for retry, and worker restarts never delete it.
+-- A successful retry flips the matching row from OPEN to RESOLVED.
+--
+-- status:
+--   OPEN      not retried successfully yet (items PENDING, RUNNING or the
+--             batch FAILED); the diagnostics endpoint derives RETRYING for
+--             rows whose items are currently being recomputed.
+--   RESOLVED  every application referenced by the failure has since reached
+--             DONE, i.e. a later successful attempt overwrote the failure.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS chunk_failures (
+    failure_id     UUID PRIMARY KEY,
+    batch_id       UUID NOT NULL REFERENCES batches (batch_id),
+    application_ids TEXT[] NOT NULL,           -- items covered by the failed chunk
+    attempt_number INTEGER NOT NULL,           -- max attempts seen on those items
+    error_category TEXT NOT NULL CHECK (
+        error_category IN ('data_error', 'sql_error', 'connection_error',
+                           'timeout', 'injected_failure', 'internal_error')
+    ),
+    error_summary  TEXT NOT NULL,
+    worker_id      TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'OPEN'
+        CHECK (status IN ('OPEN', 'RESOLVED')),
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    resolved_at    TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_chunk_failures_batch
+    ON chunk_failures (batch_id, created_at);
+
+-- ---------------------------------------------------------------------------
+-- Demo / test-only fault injection. When FAULT_INJECTION_ENABLED is on, a
+-- worker claiming one of these applications fails the chunk the configured
+-- number of times before succeeding. Never used by production code paths.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS fault_injections (
+    application_id   TEXT PRIMARY KEY,
+    fail_times       INTEGER NOT NULL CHECK (fail_times >= 0),
+    stall_seconds    REAL NOT NULL DEFAULT 0,  -- freeze the worker past its lease
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);

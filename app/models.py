@@ -101,3 +101,49 @@ class ImportAccepted(BaseModel):
     ingest_batch_id: uuid.UUID
     imported: int
     kind: str
+
+
+# --------------------------------------------------------------------------- #
+# Chunk failure diagnostics
+# --------------------------------------------------------------------------- #
+class ChunkFailure(BaseModel):
+    failure_id: uuid.UUID
+    application_ids: list[str]
+    attempt_number: int
+    error_category: str
+    error_summary: str
+    worker_id: str
+    # OPEN: not recovered; RETRYING: the items are currently being recomputed
+    # (RUNNING under a live lease); RESOLVED: a later successful attempt fixed
+    # every application listed in this failure.
+    status: str
+    created_at: datetime
+    resolved_at: datetime | None = None
+
+
+class BatchDiagnostics(BaseModel):
+    batch_id: uuid.UUID
+    batch_status: str
+    total_failures: int
+    open_failures: int
+    retrying_failures: int
+    resolved_failures: int
+    failures: list[ChunkFailure]
+
+
+# --------------------------------------------------------------------------- #
+# Demo / test-only fault injection
+# --------------------------------------------------------------------------- #
+class FaultInjectionRequest(BaseModel):
+    application_id: str = Field(min_length=1, max_length=128)
+    fail_times: int = Field(ge=0, le=100, description="该申请所在分块前 N 次计算强制失败")
+    stall_seconds: float = Field(
+        default=0, ge=0, le=600,
+        description=">0 时先令租约过期并暂停心跳，模拟执行者被 SIGKILL 后的接管",
+    )
+
+
+class FaultInjectionResponse(BaseModel):
+    application_id: str
+    fail_times: int
+    stall_seconds: float

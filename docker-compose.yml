@@ -23,6 +23,9 @@ services:
       HEARTBEAT_SECONDS: "5"
       CHUNK_SIZE: "2"          # tiny on purpose: restarts are visible in the demo
       CHUNK_DELAY_SECONDS: "1" # demo only: leaves a crash window mid-batch
+      # Enables the /api/v1/_testing/fault-injections hooks used by the
+      # diagnostics demo; the hooks are inert while no injection is configured.
+      FAULT_INJECTION_ENABLED: "true"
     ports:
       - "8001:8000"
     depends_on:
@@ -37,6 +40,7 @@ services:
       HEARTBEAT_SECONDS: "5"
       CHUNK_SIZE: "2"
       CHUNK_DELAY_SECONDS: "1"
+      FAULT_INJECTION_ENABLED: "true"
     ports:
       - "8002:8000"
     depends_on:

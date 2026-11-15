@@ -47,6 +47,25 @@ FastAPI + PostgreSQL，两个共库 API 进程协作，执行者崩溃后另一�
   超过 `MAX_CHUNK_ATTEMPTS` 标记 `FAILED`；修复后 `POST .../resume` 从断点续算。
 - 结果由主键保证不重复；未完成不开放，因此不漏算、不重复。
 
+### 分块失败诊断（新增）
+
+每次分块计算失败都会在 **独立事务** 中向 `chunk_failures` 落一条记录（先于分块
+回滚/释放），因此：
+
+- 失败分块的事务回滚后记录仍在；记录在独立事务中，**重试、进程退出与租约接管
+  都不会删除它**。
+- 每条记录包含：涉及的申请 ID 数组、当时的尝试次数 `attempt_number`、错误类别
+  `error_category`（`data_error` / `sql_error` / `connection_error` / `timeout` /
+  `injected_failure` / `internal_error`）、错误摘要 `error_summary`、负责的
+  `worker_id` 与发生时间。
+- 分块后续计算成功时，**该失败覆盖的申请全部 DONE** 后记录同步置为
+  `RESOLVED`（带 `resolved_at`）；部分覆盖不会提前解决。
+- 旧执行者租约过期后，其迟到的错误在落库前要通过 **租约归属校验**：批次租约
+  已不属于自己时直接丢弃该错误，不会覆盖接管者的诊断，也不会动接管者手上的分块。
+- 诊断查询只返回真正失败落库的行。仍在计算的分块（`PENDING` 或持有效租约的
+  `RUNNING`）没有失败记录，绝不会被报成失败；其中旧失败正在被重算的行展示为
+  `RETRYING`，租约已过期等待接管的仍为 `OPEN`。
+
 ## 三、启动（Docker Compose）
 
 ```bash
@@ -128,6 +147,62 @@ bash scripts/restart_demo.sh          # Docker 环境：重启非执行者 + SIG
 脚本会生成 60 笔数据的大批次，重启非执行者确认批次不受干扰，再 `docker compose kill`
 执行者，验证存活进程在租约过期后接管并完成，最后断言无遗漏、无重复、来源完整。
 
+### 7. 分块失败诊断演示（无需手动重启进程）
+
+compose 默认打开 `FAULT_INJECTION_ENABLED=true`，提供受控的故障注入钩子
+（生产关闭该开关后钩子返回 403）。下面用注入的失败演示完整诊断闭环：
+
+```bash
+# 7.1 让申请 A1 所在分块先失败 2 次再成功
+curl -X POST localhost:8001/api/v1/_testing/fault-injections \
+  -H 'Content-Type: application/json' \
+  -d '{"application_id":"A1","fail_times":2}'
+
+# 7.2 生成批次；期间即可在 /docs 或命令行查看 OPEN/RETRYING 的失败记录
+BID=$(curl -s -X POST localhost:8001/api/v1/batches \
+  -H 'Content-Type: application/json' \
+  -d '{"application_ids":["A1","A2","A3"]}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["batch_id"])')
+curl -s localhost:8001/api/v1/batches/$BID/diagnostics | python3 -m json.tool
+# 批次完成后每条失败 status 变为 RESOLVED，并带 resolved_at
+
+# 7.3 租约接管 + 迟到错误丢弃：先令执行者租约过期（暂停心跳），由另一进程接管
+curl -X POST localhost:8001/api/v1/_testing/fault-injections \
+  -H 'Content-Type: application/json' \
+  -d '{"application_id":"A4","fail_times":1,"stall_seconds":20}'
+# A4 批次最终仍 COMPLETED，且 diagnostics 中没有旧执行者迟到写入的失败行
+
+# 7.4 清理注入
+curl -X DELETE localhost:8001/api/v1/_testing/fault-injections/A1
+curl -X DELETE localhost:8001/api/v1/_testing/fault-injections/A4
+```
+
+诊断响应结构：
+
+```json
+{
+  "batch_id": "…", "batch_status": "COMPLETED",
+  "total_failures": 2, "open_failures": 0,
+  "retrying_failures": 0, "resolved_failures": 2,
+  "failures": [{
+    "failure_id": "…",
+    "application_ids": ["A1", "A2"],
+    "attempt_number": 2,
+    "error_category": "injected_failure",
+    "error_summary": "InjectedChunkError: injected chunk failure …",
+    "worker_id": "…", "status": "RESOLVED",
+    "created_at": "…", "resolved_at": "…"
+  }]
+}
+```
+
+也可直接运行自动化测试（需要两个共库进程，参数为两个基地址与数据库 DSN）：
+
+```bash
+python3 scripts/diagnostics_test.py \
+    http://127.0.0.1:8001 http://127.0.0.1:8002 \
+    postgresql://postgres:postgres@127.0.0.1:55432/riskdb
+```
+
 ## 五、脚本与测试
 
 | 脚本 | 作用 |
@@ -137,6 +212,7 @@ bash scripts/restart_demo.sh          # Docker 环境：重启非执行者 + SIG
 | `scripts/gen_bulk.py` | 经 API 生成大批量虚构数据 |
 | `scripts/restart_demo.sh` | Docker 下的重启/故障转移演示 |
 | `scripts/lease_failover_test.py` | 不依赖 Docker 的租约接管测试（以 SQL 令租约过期精确模拟 SIGKILL 后的状态） |
+| `scripts/diagnostics_test.py` | 分块失败诊断端到端测试（失败留痕、重试解决、迟到错误丢弃、RETRYING 语义、resume 保留历史） |
 | `scripts/test_pit_sql.py` | 时点重建 SQL 的 10 项边界单元测试（修订/撤回/未来事件/并列/栅栏/空值） |
 
 无 Docker 的本地验证方式（需要一个 PostgreSQL 并设置 `DATABASE_URL`）：
@@ -160,8 +236,10 @@ DATABASE_URL=postgresql://... python3 scripts/lease_failover_test.py \
 | POST | `/api/v1/imports/credit-events` | 整批事务导入事件版本，同键异值全拒绝 |
 | POST | `/api/v1/batches` | 生成回填批次（固化受理时输入） |
 | GET | `/api/v1/batches` / `/api/v1/batches/{id}` | 批次状态 |
-| POST | `/api/v1/batches/{id}/resume` | FAILED 批次断点续算 |
+| POST | `/api/v1/batches/{id}/resume` | FAILED 批次断点续算（历史失败记录保留，成功后置 RESOLVED） |
 | GET | `/api/v1/batches/{id}/results?limit=&cursor=` | 完成后分页查询结果 |
+| GET | `/api/v1/batches/{id}/diagnostics` | 分块失败诊断：申请 ID、尝试次数、错误类别/摘要、OPEN/RETRYING/RESOLVED 状态 |
+| POST/GET/DELETE | `/api/v1/_testing/fault-injections[/{appId}]` | 演示/测试故障注入（需 `FAULT_INJECTION_ENABLED=true`，否则 403） |
 | GET | `/api/v1/applications` / `/api/v1/events` | 已导入数据检查 |
 | GET | `/health` | 进程与 worker 身份 |
 

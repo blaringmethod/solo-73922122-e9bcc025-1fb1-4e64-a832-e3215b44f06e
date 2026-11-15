@@ -34,3 +34,8 @@ MAX_CHUNK_ATTEMPTS = int(os.getenv("MAX_CHUNK_ATTEMPTS", "5"))
 # Pagination.
 DEFAULT_PAGE_SIZE = int(os.getenv("DEFAULT_PAGE_SIZE", "100"))
 MAX_PAGE_SIZE = int(os.getenv("MAX_PAGE_SIZE", "1000"))
+
+# Demo/test-only switch for the fault_injections table (off in production).
+FAULT_INJECTION_ENABLED = os.getenv("FAULT_INJECTION_ENABLED", "false").lower() in (
+    "1", "true", "yes", "on",
+)

@@ -22,6 +22,51 @@ from . import config
 logger = logging.getLogger("income.worker")
 
 
+class InjectedChunkError(RuntimeError):
+    """Raised by the demo/test fault-injection hook."""
+
+
+def classify_error(exc: BaseException) -> tuple[str, str]:
+    """Map an exception to (error_category, short summary).
+
+    The category is a stable vocabulary used by the diagnostics API; the
+    summary is the exception's own message, truncated to keep the row small.
+    Subclass checks are ordered most-specific first: integrity/data errors are
+    PostgresError subclasses and would otherwise be swallowed by the generic
+    SQL branch.
+    """
+    if isinstance(exc, InjectedChunkError):
+        category = "injected_failure"
+    elif isinstance(exc, asyncpg.QueryCanceledError):
+        category = "timeout"
+    elif isinstance(exc, (asyncpg.ConnectionDoesNotExistError,
+                          asyncpg.ConnectionFailureError,
+                          asyncpg.CannotConnectNowError,
+                          ConnectionError)):
+        # Connection errors are PostgresError subclasses in asyncpg, so this
+        # branch must precede the generic SQL one.
+        category = "connection_error"
+    elif isinstance(exc, (asyncpg.ForeignKeyViolationError,
+                          asyncpg.UniqueViolationError,
+                          asyncpg.NotNullViolationError,
+                          asyncpg.DataError,
+                          asyncpg.NumericValueOutOfRangeError)):
+        category = "data_error"
+    elif isinstance(exc, asyncpg.PostgresError):
+        # Every other server-side SQL failure (syntax, schema, internal...).
+        category = "sql_error"
+    else:
+        category = "internal_error"
+    try:
+        message = str(exc)
+    except Exception:  # some asyncpg exceptions raise from __str__ with no args
+        message = repr(exc)
+    if not message:
+        message = repr(exc)
+    summary = f"{type(exc).__name__}: {message}"[:500]
+    return category, summary
+
+
 # ---------------------------------------------------------------------------
 # The point-in-time reconstruction, expressed in one SQL statement per chunk.
 #
@@ -205,6 +250,45 @@ SET status = 'FAILED', error = $2
 WHERE batch_id = $1;
 """
 
+# Persist the failure record BEFORE the failed items are released for retry.
+# Keeping it in a separate committed transaction means the record survives the
+# failed chunk's rollback, worker exits and lease takeover.
+_INSERT_FAILURE_SQL = """
+INSERT INTO chunk_failures
+    (failure_id, batch_id, application_ids, attempt_number, error_category,
+     error_summary, worker_id, status)
+VALUES ($1, $2, $3, $4, $5, $6, $7, 'OPEN');
+"""
+
+# A success only resolves failures whose applications are all DONE. Partial
+# overlap (a chunk can contain several applications) leaves the row OPEN.
+_RESOLVE_FAILURES_SQL = """
+UPDATE chunk_failures cf
+SET status = 'RESOLVED', resolved_at = now()
+WHERE cf.batch_id = $1
+  AND cf.status = 'OPEN'
+  AND NOT EXISTS (
+      SELECT 1
+      FROM unnest(cf.application_ids) AS f(application_id)
+      LEFT JOIN batch_items bi
+        ON bi.batch_id = cf.batch_id AND bi.application_id = f.application_id
+      WHERE bi.status IS DISTINCT FROM 'DONE'
+  );
+"""
+
+# Fault-injection hook (demo/test only, gated by config.FAULT_INJECTION_ENABLED).
+_FAULT_LOOKUP_SQL = """
+SELECT application_id, fail_times, stall_seconds
+FROM fault_injections
+WHERE application_id = ANY($1)
+"""
+
+_FAULT_DECREMENT_SQL = """
+UPDATE fault_injections
+SET fail_times = greatest(fail_times - 1, 0)
+WHERE application_id = ANY($1)
+"""
+
 
 class Worker:
     def __init__(self, pool: asyncpg.Pool, worker_id: str) -> None:
@@ -214,6 +298,9 @@ class Worker:
         self._task: asyncio.Task | None = None
         self._current_batch: uuid.UUID | None = None
         self._heartbeat_task: asyncio.Task | None = None
+        # Demo/test fault injection pauses heartbeats while a chunk is stalled,
+        # reproducing the lease-expiry state left by a SIGKILLed worker.
+        self._heartbeat_paused = False
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name=f"worker-{self.worker_id}")
@@ -262,6 +349,9 @@ class Worker:
     async def _heartbeat(self, batch_id: uuid.UUID) -> None:
         while True:
             await asyncio.sleep(config.HEARTBEAT_SECONDS)
+            if self._heartbeat_paused:
+                # A demo stall intentionally freezes this worker like a crash.
+                continue
             try:
                 async with self.pool.acquire() as conn:
                     await conn.execute(
@@ -286,27 +376,36 @@ class Worker:
                 )
             if not claimed:
                 break
+            app_ids = [r["application_id"] for r in claimed]
             try:
+                await self._maybe_inject_failure(batch_id, app_ids)
                 async with self.pool.acquire() as conn:
                     async with conn.transaction():
                         await conn.execute(
                             _COMPUTE_CHUNK_SQL, batch_id, self.worker_id, config.CHUNK_SIZE
                         )
+                # Success: mark every OPEN failure fully covered by DONE items
+                # as resolved, in the same logical step as the completion.
+                async with self.pool.acquire() as conn:
+                    await conn.execute(_RESOLVE_FAILURES_SQL, batch_id)
                 if config.CHUNK_DELAY_SECONDS:
                     await asyncio.sleep(config.CHUNK_DELAY_SECONDS)
-            except Exception:
+            except Exception as exc:
                 # The failed transaction rolled back, so the items remain
-                # RUNNING under our lease. Release them for re-claim; the
-                # persisted `attempts` counter survives worker restarts.
+                # RUNNING under our lease. Persist the failure record and only
+                # then hand the items back for re-claim. Both the persisted
+                # `attempts` counter and chunk_failures survive worker exits.
                 logger.exception("chunk failed for batch %s", batch_id)
-                async with self.pool.acquire() as conn:
-                    await conn.execute(_RELEASE_CHUNK_SQL, batch_id, self.worker_id)
-                    max_attempts = await conn.fetchval(_MAX_ATTEMPTS_SQL, batch_id)
-                if max_attempts and max_attempts >= config.MAX_CHUNK_ATTEMPTS:
+                category, summary = classify_error(exc)
+                max_attempts = await self._record_failure_and_release(
+                    batch_id, app_ids, category, summary
+                )
+                if max_attempts is not None and max_attempts >= config.MAX_CHUNK_ATTEMPTS:
                     async with self.pool.acquire() as conn:
                         await conn.execute(
                             _FAIL_SQL, batch_id,
-                            f"an item failed after {max_attempts} attempts; see api logs",
+                            f"an item failed after {max_attempts} attempts; "
+                            f"see /api/v1/batches/{batch_id}/diagnostics",
                         )
                     return
                 await asyncio.sleep(0.5)
@@ -321,3 +420,100 @@ class Worker:
             # will reclaim them; this batch stays RUNNING until its lease
             # expires and is picked up again.
             logger.warning("batch %s not completable yet; releasing for reclaim", batch_id)
+
+    async def _record_failure_and_release(
+        self,
+        batch_id: uuid.UUID,
+        app_ids: list[str],
+        category: str,
+        summary: str,
+    ) -> int | None:
+        """Persist the failure row and release the failed chunk.
+
+        Stale-owner guard: the worker's batch lease must still be live. If this
+        worker was stalled past its lease and another process took over, the
+        late error is discarded so it can never overwrite the takeover's
+        diagnostics or disturb the new owner's items.
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                # Lease check is done in SQL against the database clock so the
+                # two API processes need no synchronised system clock.
+                owner = await conn.fetchrow(
+                    """SELECT worker_id,
+                              (lease_expires_at IS NOT NULL
+                               AND lease_expires_at > now()) AS lease_live
+                         FROM batches WHERE batch_id = $1
+                       FOR UPDATE""",
+                    batch_id,
+                )
+                still_owner = (
+                    owner is not None
+                    and owner["worker_id"] == self.worker_id
+                    and owner["lease_live"]
+                )
+                if not still_owner:
+                    logger.warning(
+                        "worker %s lost batch %s before recording its failure; "
+                        "dropping the stale error (owner now %s)",
+                        self.worker_id, batch_id,
+                        owner["worker_id"] if owner else None,
+                    )
+                    return None
+                attempt_number = await conn.fetchval(
+                    """SELECT max(attempts) FROM batch_items
+                        WHERE batch_id = $1 AND application_id = ANY($2)""",
+                    batch_id, app_ids,
+                )
+                await conn.execute(
+                    _INSERT_FAILURE_SQL,
+                    uuid.uuid4(), batch_id, app_ids, attempt_number,
+                    category, summary, self.worker_id,
+                )
+                await conn.execute(_RELEASE_CHUNK_SQL, batch_id, self.worker_id)
+                max_attempts = await conn.fetchval(_MAX_ATTEMPTS_SQL, batch_id)
+        return max_attempts
+
+    async def _maybe_inject_failure(self, batch_id: uuid.UUID, app_ids: list[str]) -> None:
+        """Demo/test hook backed by the fault_injections table.
+
+        For every listed application with fail_times > 0 the chunk fails once;
+        a positive stall_seconds first lets this worker's leases expire (with
+        heartbeats paused) so another process takes over before the late error
+        arrives — exercising the stale-writer guard.
+        """
+        if not config.FAULT_INJECTION_ENABLED:
+            return
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(_FAULT_LOOKUP_SQL, app_ids)
+            active = [r for r in rows if r["fail_times"] > 0]
+            if not active:
+                return
+            stall = max(r["stall_seconds"] for r in active)
+            await conn.execute(_FAULT_DECREMENT_SQL,
+                               [r["application_id"] for r in active])
+        if stall > 0:
+            logger.warning(
+                "FAULT INJECTION: worker %s stalling %ss on batch %s; leases will expire",
+                self.worker_id, stall, batch_id,
+            )
+            self._heartbeat_paused = True
+            try:
+                async with self.pool.acquire() as conn:
+                    # Reproduce the exact post-SIGKILL state: leases in the past.
+                    await conn.execute(
+                        "UPDATE batches SET lease_expires_at = now() - interval '1 second' "
+                        "WHERE batch_id = $1 AND worker_id = $2",
+                        batch_id, self.worker_id,
+                    )
+                    await conn.execute(
+                        "UPDATE batch_items SET lease_expires_at = now() - interval '1 second' "
+                        "WHERE batch_id = $1 AND worker_id = $2",
+                        batch_id, self.worker_id,
+                    )
+                await asyncio.sleep(stall)
+            finally:
+                self._heartbeat_paused = False
+        raise InjectedChunkError(
+            f"injected chunk failure for applications {sorted(r['application_id'] for r in active)}"
+        )

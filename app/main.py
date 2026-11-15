@@ -19,8 +19,12 @@ from .db import close_pool, get_pool, init_pool, init_schema
 from .models import (
     ApplicationsImport,
     BatchCreateRequest,
+    BatchDiagnostics,
     BatchResponse,
+    ChunkFailure,
     CreditEventsImport,
+    FaultInjectionRequest,
+    FaultInjectionResponse,
     ImportAccepted,
     ResultsPage,
     ResultRow,
@@ -47,11 +51,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Point-in-time Income Backfill API",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
     description=(
         "历史贷款申请的申请时点收入回填服务。征信事件按获知时间保留全部版本，"
         "生成批次固化受理时已提交的输入，两个 API 进程共享数据库并协作续算。"
+        "另提供批次分块失败诊断（/batches/{id}/diagnostics）：每次计算失败的"
+        "申请、尝试次数、错误类别与摘要，以及是否已被成功重试解决。"
     ),
 )
 _worker: Worker | None = None
@@ -415,6 +421,152 @@ async def get_results(
     ]
     return ResultsPage(batch_id=batch_id, status="COMPLETED", limit=limit,
                        next_cursor=next_cursor, items=items)
+
+
+# --------------------------------------------------------------------------- #
+# Batch diagnostics — every failed chunk attempt, and whether retry fixed it
+# --------------------------------------------------------------------------- #
+@app.get(
+    "/api/v1/batches/{batch_id}/diagnostics",
+    response_model=BatchDiagnostics,
+    tags=["diagnostics"],
+    summary="批次分块失败诊断（失败申请、尝试次数、错误类别/摘要、是否已重试解决）",
+)
+async def get_batch_diagnostics(batch_id: uuid.UUID) -> BatchDiagnostics:
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        batch = await conn.fetchrow(
+            "SELECT status FROM batches WHERE batch_id = $1", batch_id
+        )
+        if not batch:
+            raise HTTPException(404, "batch not found")
+        # Only rows actually written on a failed attempt are returned. Items
+        # that are PENDING or currently RUNNING produce no row, so chunks still
+        # being computed are never reported as failures.
+        rows = await conn.fetch(
+            """
+            SELECT cf.failure_id, cf.application_ids, cf.attempt_number,
+                   cf.error_category, cf.error_summary, cf.worker_id,
+                   cf.status AS stored_status, cf.created_at, cf.resolved_at,
+                   EXISTS (
+                       SELECT 1
+                       FROM unnest(cf.application_ids) AS f(application_id)
+                       JOIN batch_items bi
+                         ON bi.batch_id = cf.batch_id
+                        AND bi.application_id = f.application_id
+                      WHERE bi.status = 'RUNNING'
+                        AND bi.lease_expires_at > now()
+                   ) AS being_retried
+              FROM chunk_failures cf
+             WHERE cf.batch_id = $1
+             ORDER BY cf.created_at, cf.failure_id
+            """,
+            batch_id,
+        )
+    failures: list[ChunkFailure] = []
+    open_count = retrying_count = resolved_count = 0
+    for r in rows:
+        if r["stored_status"] == "RESOLVED":
+            derived = "RESOLVED"
+            resolved_count += 1
+        elif r["being_retried"]:
+            derived = "RETRYING"
+            retrying_count += 1
+        else:
+            derived = "OPEN"
+            open_count += 1
+        failures.append(
+            ChunkFailure(
+                failure_id=r["failure_id"],
+                application_ids=r["application_ids"],
+                attempt_number=r["attempt_number"],
+                error_category=r["error_category"],
+                error_summary=r["error_summary"],
+                worker_id=r["worker_id"],
+                status=derived,
+                created_at=r["created_at"],
+                resolved_at=r["resolved_at"],
+            )
+        )
+    return BatchDiagnostics(
+        batch_id=batch_id,
+        batch_status=batch["status"],
+        total_failures=len(failures),
+        open_failures=open_count,
+        retrying_failures=retrying_count,
+        resolved_failures=resolved_count,
+        failures=failures,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Fault injection (demo/test only; disabled unless FAULT_INJECTION_ENABLED)
+# --------------------------------------------------------------------------- #
+def _require_fault_injection() -> None:
+    if not config.FAULT_INJECTION_ENABLED:
+        raise HTTPException(
+            403,
+            "fault injection is disabled on this deployment "
+            "(set FAULT_INJECTION_ENABLED=true to enable)",
+        )
+
+
+@app.post(
+    "/api/v1/_testing/fault-injections",
+    response_model=FaultInjectionResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["testing"],
+    summary="（演示/测试）为某个申请注入分块计算失败",
+)
+async def put_fault_injection(payload: FaultInjectionRequest) -> FaultInjectionResponse:
+    _require_fault_injection()
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO fault_injections
+                   (application_id, fail_times, stall_seconds)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (application_id) DO UPDATE
+                 SET fail_times = EXCLUDED.fail_times,
+                     stall_seconds = EXCLUDED.stall_seconds
+             RETURNING application_id, fail_times, stall_seconds""",
+            payload.application_id, payload.fail_times, payload.stall_seconds,
+        )
+    return FaultInjectionResponse(**dict(row.items()))
+
+
+@app.get(
+    "/api/v1/_testing/fault-injections",
+    response_model=list[FaultInjectionResponse],
+    tags=["testing"],
+    summary="（演示/测试）查看当前生效的故障注入",
+)
+async def list_fault_injections() -> list[FaultInjectionResponse]:
+    _require_fault_injection()
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT application_id, fail_times, stall_seconds
+                 FROM fault_injections ORDER BY application_id"""
+        )
+    return [FaultInjectionResponse(**dict(r.items())) for r in rows]
+
+
+@app.delete(
+    "/api/v1/_testing/fault-injections/{application_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["testing"],
+    summary="（演示/测试）清除某个申请的故障注入",
+)
+async def delete_fault_injection(application_id: str) -> None:
+    _require_fault_injection()
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        tag = await conn.execute(
+            "DELETE FROM fault_injections WHERE application_id = $1", application_id
+        )
+    if tag == "DELETE 0":
+        raise HTTPException(404, "fault injection not found")
 
 
 # --------------------------------------------------------------------------- #
